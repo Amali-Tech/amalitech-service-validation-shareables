@@ -1,0 +1,523 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AWS Serverless Spring Boot 2 API - org.example::photo-blog-app
+Globals:
+  Api:
+    EndpointConfiguration: REGIONAL
+
+Parameters:
+  FrontendDevHost:
+    Type: String
+    Default: "http://localhost:4200"
+    Description: The hosted frontend
+  FrontendProdHost:
+    Type: String
+    Default: "http://localhost:4200"
+    Description: The localhost of my frontend
+  PrimaryBucket:
+    Type: String
+    Default: "photo-blog-app-primary-bucket-24"
+    Description: Primary bucket for s3 bucket
+  BackupBucket:
+    Type: String
+    Default: "photo-blog-app-backup-bucket-24"
+    Description: Backup bucket for s3 bucket
+  PrimaryStagingBucket:
+    Type: String
+    Default: "photo-blog-app-primary-staging-bucket-24"
+    Description: Primary staging bucket
+  BackupStagingBucket:
+    Type: String
+    Default: "photo-blog-app-backup-staging-bucket-24"
+    Description: Backup staging bucket
+  DynamoDBGlobalTable:
+    Type: String
+    Default: "dynamodb-global-table"
+    Description: DynamoDB global table
+  PrimaryRegion:
+    Type: String
+    Default: "eu-central-1"
+    Description: Backup region for disaster recovery
+  BackupRegion:
+    Type: String
+    Default: "eu-west-1"
+    Description: Backup region for disaster recovery
+  DomainName:
+    Type: String
+    Description: Custom domain name for your primary and backup API Gateway
+  PrimaryACMCertificateArn:
+    Type: String
+    Description: AWS Certificate Manager certificate for primary region
+  BackupACMCertificateArn:
+    Type: String
+    Description: AWS Certificate Manager certificate for backup region
+
+Conditions:
+  IsPrimaryRegion: !Equals [!Ref AWS::Region, !Ref PrimaryRegion]
+  IsBackupRegion: !Equals [ !Ref AWS::Region, !Ref BackupRegion ]
+
+
+Resources:
+  ## Lambda function for API-GATEWAY
+  PhotoBlogAppFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: org.example.StreamLambdaHandler::handleRequest
+      Runtime: java21
+      CodeUri: .
+      MemorySize: 512
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !Sub
+                  - arn:aws:s3:::${MainBucket}
+                  - MainBucket: !If
+                      - IsPrimaryRegion
+                      - !Ref PrimaryBucket
+                      - !Ref BackupBucket
+                - !Sub
+                  - arn:aws:s3:::${StagingBucket}
+                  - StagingBucket: !If
+                      - IsPrimaryRegion
+                      - !Ref PrimaryStagingBucket
+                      - !Ref BackupStagingBucket
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                - !GetAtt ImageProcessingLambda.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:DeleteItem
+              Resource:
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBGlobalTable}
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBGlobalTable}/index/*
+            - Effect: Allow
+              Action:
+                - cognito-idp:ListUsers
+                - cognito-idp:AdminGetUser
+              Resource: !GetAtt UserPool.Arn
+      Timeout: 30
+      Events:
+        ProxyResource:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: any
+      Environment:
+        Variables:
+          S3_BUCKET_PRIMARY: !If
+            - IsPrimaryRegion
+            - !Ref PrimaryBucket
+            - !Ref BackupBucket
+          S3_BUCKET_STAGING: !If
+            - IsPrimaryRegion
+            - !Ref PrimaryStagingBucket
+            - !Ref BackupStagingBucket
+          DYNAMODB_TABLE: !Ref DynamoDBGlobalTable
+          IMAGE_PROCESSING_LAMBDA: !Ref ImageProcessingLambda
+          TASK_QUEUE: !Ref TaskQueue
+          COGNITO_USER_POOL_ID: !Ref UserPool
+          FRONTEND_DEV_URL: !Ref FrontendDevHost
+          FRONTEND_PROD_URL: !Ref FrontendProdHost
+
+  # Custom Domain for API Gateway
+  ApiGatewayDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      RegionalCertificateArn: !If
+        - IsPrimaryRegion
+        - !Ref PrimaryACMCertificateArn
+        - !Ref BackupACMCertificateArn
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Base path for custom domain
+  CustomDomainBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Properties:
+      DomainName: !Ref ApiGatewayDomainName
+      RestApiId: !Sub ${ServerlessRestApi}
+      Stage: !Sub ${ServerlessRestApiProdStage}
+
+  # Lambda Function for SQS Notification Processing
+  ImageProcessingLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-ImageProcessingLambda
+      Handler: org.example.ImageProcessingLambda::handleRequest
+      Runtime: java21
+      CodeUri: .
+      MemorySize: 512
+      Timeout: 30
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:ListBucket
+              Resource:
+                - !Sub
+                  - arn:aws:s3:::${MainBucket}
+                  - MainBucket: !If
+                      - IsPrimaryRegion
+                      - !Ref PrimaryBucket
+                      - !Ref BackupBucket
+                - !Sub
+                  - arn:aws:s3:::${StagingBucket}
+                  - StagingBucket: !If
+                      - IsPrimaryRegion
+                      - !Ref PrimaryStagingBucket
+                      - !Ref BackupStagingBucket
+            - Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource:
+                - !GetAtt StepFunctionStateMachine.Arn
+            - Effect: Allow
+              Action:
+                - sqs:sendmessage
+              Resource:
+                - !GetAtt TaskQueue.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+              Resource:
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBGlobalTable}
+      Environment:
+        Variables:
+          S3_BUCKET_PRIMARY: !If
+            - IsPrimaryRegion
+            - !Ref PrimaryBucket
+            - !Ref BackupBucket
+          DYNAMODB_TABLE: !Ref DynamoDBGlobalTable
+          STEP_FUNCTION_ARN: !Ref StepFunctionStateMachine
+          TASK_QUEUE: !Ref TaskQueue
+
+  # Lambda Function for SES Notification Processing
+  SQSEventLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-SQSEventLambda
+      Handler: org.example.SQSEventLambda::handleRequest
+      Runtime: java21
+      CodeUri: .
+      MemorySize: 512
+      Timeout: 30
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt TaskQueue.Arn
+            - Effect: Allow
+              Action:
+                - sns:Publish
+                - sns:ListSubscriptionsByTopic
+                - sns:GetSubscriptionAttributes
+                - sns:SetSubscriptionAttributes
+              Resource: !Ref NotificationTopic
+      Environment:
+        Variables:
+          NOTIFICATION_TOPIC_ARN: !Ref NotificationTopic
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TaskQueue.Arn
+            BatchSize: 5
+
+  # Lambda Function to send sns subscription after signup
+  CognitoEventLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CognitoEventLambda
+      Handler: org.example.CognitoEventLambda::handleRequest
+      Runtime: java21
+      CodeUri: .
+      MemorySize: 512
+      Timeout: 30
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - sns:Subscribe
+              Resource:
+                - !Ref NotificationTopic
+            - Effect: Allow
+              Action:
+                - sqs:sendmessage
+              Resource:
+                - !GetAtt TaskQueue.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+              Resource:
+                - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBGlobalTable}
+      Environment:
+        Variables:
+          NOTIFICATION_TOPIC_ARN: !Ref NotificationTopic
+          TASK_QUEUE: !Ref TaskQueue
+          DYNAMODB_TABLE: !Ref DynamoDBGlobalTable
+      Events:
+        CognitoEvents:
+          Type: Cognito
+          Properties:
+            UserPool: !Ref UserPool
+            Trigger:
+              - PostConfirmation
+              - PostAuthentication
+
+  # Lambda Function for creating recycle bin folder
+  #  CloudFormationCustomResourceLambda:
+  #    Type: AWS::Serverless::Function
+  #    Properties:
+  #      FunctionName: !Sub ${AWS::StackName}-CloudFormationCustomResourceLambda
+  #      Handler: org.example.CloudFormationCustomResourceLambda::handleRequest
+  #      Runtime: java21
+  #      CodeUri: .
+  #      MemorySize: 512
+  #      Timeout: 30
+  #      Policies: AWSLambdaBasicExecutionRole
+
+  # Custom resource to perform actions during stack update, creation or deletion
+  #  MyCustomResource:
+  #    Type: Custom::MyCustomResource
+  #    Properties:
+  #      ServiceToken: !GetAtt CloudFormationCustomResourceLambda.Arn
+  #      ServiceTimeout: 30
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-UserPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      AdminCreateUserConfig:
+        InviteMessageTemplate: !If
+          - IsBackupRegion
+          -
+            EmailSubject: "Password Reset"
+            EmailMessage:  !Sub |
+              Hello {username}, to enhance security, change your password. Your temporary password is {####}
+              Please visit ${FrontendProdHost} to login and change password.
+          - !Ref "AWS::NoValue"
+
+  # Cognito User Pool Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-UserPoolClient
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - aws.cognito.signin.user.admin
+        - profile
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      CallbackURLs:
+        - !Sub "${FrontendDevHost}/oauth2/code"
+        - !Sub "${FrontendProdHost}/oauth2/code"
+      UserPoolId: !Ref UserPool
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 6
+      IdTokenValidity: 6
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # Cognito User Pool Domain
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${AWS::StackName}-domain
+      UserPoolId: !Ref UserPool
+
+
+  # SNS topic to send notification
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-NotificationTopic
+
+  # SQS for queuing messages
+  TaskQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-TaskQueue
+
+  # Step function state machine
+  StepFunctionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${AWS::StackName}-StepFunctionStateMachine
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "DetermineWorkflow",
+          "States": {
+            "DetermineWorkflow": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.workflowType",
+                  "StringEquals": "image-processing-retry",
+                  "Next": "CheckRetryAttempt"
+                }
+              ],
+              "Default": "FailState"
+            },
+            "CheckRetryAttempt": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.retryAttempt",
+                  "NumericLessThan": 3,
+                  "Next": "WaitBeforeRetry"
+                }
+              ],
+              "Default": "FailState"
+            },
+            "WaitBeforeRetry": {
+              "Type": "Wait",
+              "Seconds": 300,
+              "Next": "ImageProcessing"
+            },
+            "ImageProcessing": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-ImageProcessingLambda",
+              "Parameters": {
+                "bucketName.$": "$.bucketName",
+                "objectKey.$": "$.objectKey",
+                "email.$": "$.email",
+                "fullName.$": "$.fullName",
+                "retryAttempt.$": "$.retryAttempt"
+              },
+              "Next": "SuccessState"
+            },
+            "SuccessState": {
+              "Type": "Succeed"
+            },
+            "FailState": {
+              "Type": "Fail",
+              "Error": "ProcessingFailed",
+              "Cause": "Image processing failed after retries."
+            }
+          }
+        }
+
+
+
+  # IAM ROLES
+  # Step Functions Role
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-ImageProcessingLambda
+
+
+Outputs:
+  PhotoBlogAppApi:
+    Description: URL for application
+    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod'
+    Export:
+      Name: PhotoBlogAppApi
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+
+  UserPoolDomainURL:
+    Description: Cognito User Pool Domain Hosted UI URL
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+
+  CognitoLoginURL:
+    Description: Cognito User Pool Application Client Hosted Login UI URL
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=code&redirect_uri=${FrontendProdHost}/oauth2/code'
+
+  CognitoUserPoolClientInfo:
+    Description: AWS CLI command for Amazon Cognito User Pool information
+    Value: !Sub "aws cognito-idp describe-user-pool-client --user-pool-id ${UserPool} --client-id ${UserPoolClient}"
