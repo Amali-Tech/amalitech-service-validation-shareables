@@ -1,0 +1,218 @@
+# Ingress Configuration
+
+# This file shows the two-layer ingress architecture used by the Gigabit platform:
+#
+#  Layer 1 — ALB (AWS Load Balancer Controller)
+#    Provisioned by Pulumi via createALBIngresses(). Handles TLS termination using
+#    ACM certificates. Enforces HTTPS-only (HTTP/80 → 301 redirect to HTTPS/443).
+#    Forwards decrypted HTTP/80 to the NGINX controller service.
+#
+#  Layer 2 — NGINX Ingress Controller
+#    Provisioned by Pulumi via createController(). Handles host/path routing to
+#    application pods. Application teams write Ingress objects targeting either
+#    nginx-internal or nginx-external IngressClass.
+#
+# Traffic flow:
+#   Internet:  Client → Route53 → ALB (HTTPS/443, TLS terminated) → nginx-external:80 → pod
+#   Intranet:  Client → Route53 → NLB (TCP/443, L4 passthrough)   → nginx-internal:443 → pod
+#              Client → Route53 → ALB (internal, TLS terminated)  → nginx-internal:80  → pod
+#
+# Source: inferred from ingress.go + EKS-Self-Assessment-Gigabit.md § EKS-016
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYER 1a: Internet-facing ALB Ingress
+# Managed by: AWS Load Balancer Controller (ALBC)
+# Provisioned by: Pulumi ingress module — createALBIngresses(ctx, k8sProvider, "internet", alb)
+#
+# This Ingress object is processed by ALBC which provisions a single internet-facing
+# Application Load Balancer. All domain elements for the "internet" group share this
+# ALB via alb.ingress.kubernetes.io/group.name.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: internet-alb-ingress
+  namespace: platform-ingress
+  annotations:
+    # Route to ALBC — not NGINX.
+    kubernetes.io/ingress.class: alb
+
+    # All internet-facing Ingress objects share one ALB under this group name.
+    # ALBC merges them into a single ALB with listener rules per host.
+    alb.ingress.kubernetes.io/group.name: internet
+
+    # Public ALB — reachable from the internet.
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    # Route traffic directly to pod IPs (VPC CNI). No NodePort hop.
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # Accept HTTP on port 80 only to issue a redirect.
+    # All real traffic travels over HTTPS/443.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+
+    # Enforce HTTPS: any HTTP/80 request receives a 301 redirect to HTTPS/443.
+    # This satisfies the EKS-016 requirement that all L7 traffic is secured with TLS.
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # ACM certificate ARN — provisioned by resolveOrCreateCertificate() in ingress-generated.go
+    # or supplied as a pre-existing ARN in the Pulumi stack config.
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:eu-central-1:ACCOUNT_ID:certificate/CERT_ID
+
+    # ALB forwards decrypted HTTP/80 to the NGINX external controller service.
+    # NGINX applies host/path rules from application Ingress objects (Layer 2 below).
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+
+    # ALB access logs written to S3 for security audit and traffic analysis.
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=project-alb-access-logs,
+      access_logs.s3.prefix=internet/default
+    # Managed-by label for ops visibility.
+    pulumi.com/managed-by: ingress-module
+spec:
+  # Default backend: all ALB traffic falls through to the NGINX external controller.
+  # NGINX then routes to individual application services using its own rule set
+  # (see Layer 2 Ingress objects below).
+  defaultBackend:
+    service:
+      name: nginx-ingress-external-controller # NGINX external controller ClusterIP/NodePort svc
+      port:
+        number: 80
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYER 1b: Intranet ALB Ingress (internal)
+# Managed by: AWS Load Balancer Controller (ALBC)
+# Provisioned by: Pulumi ingress module — createALBIngresses(ctx, k8sProvider, "intranet", alb)
+#
+# Same structure as the internet ALB but with scheme: internal.
+# Reachable only from within the VPC or via VPN/Direct Connect.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: intranet-alb-ingress
+  namespace: platform-ingress
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/group.name: intranet
+    # Internal ALB — not reachable from the public internet.
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:eu-central-1:ACCOUNT_ID:certificate/CERT_ID_INTERNAL
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=project-alb-access-logs,
+      access_logs.s3.prefix=intranet/default
+    pulumi.com/managed-by: ingress-module
+spec:
+  defaultBackend:
+    service:
+      name: nginx-ingress-internal-controller # NGINX internal controller svc
+      port:
+        number: 80
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYER 2: Application Ingress (NGINX — written by application teams)
+#
+# Application teams write Ingress objects targeting one of two IngressClasses:
+#   nginx-internal  — routed via the internal NGINX controller (intranet traffic)
+#   nginx-external  — routed via the external NGINX controller (internet traffic)
+#
+# The custom shared library (referenced in EKS-016) auto-sets the correct
+# ingressClassName based on whether the service is internal or external —
+# teams only specify the service name and port.
+#
+# NGINX receives already-decrypted HTTP/80 from the ALB. TLS has been terminated
+# at Layer 1. NGINX applies host/path rules and proxies to application pods.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-app-external-ingress
+  namespace: team-alpha
+  annotations:
+    # No ALB annotations here — this is handled by NGINX, not ALBC.
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # Force backend connections to use HTTP (TLS already terminated at ALB).
+    nginx.ingress.kubernetes.io/backend-protocol: HTTP
+spec:
+  # Target the external NGINX controller — set automatically by the shared library.
+  ingressClassName: nginx-external
+  rules:
+    - host: app-alpha.project.company.de
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: app-alpha-backend
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app-alpha-frontend
+                port:
+                  number: 3000
+
+---
+# Internal variant — same app exposed on the intranet only.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-app-internal-ingress
+  namespace: team-alpha
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/backend-protocol: HTTP
+spec:
+  # Target the internal NGINX controller — intranet traffic only.
+  ingressClassName: nginx-internal
+  rules:
+    - host: app-alpha.internal.project.company.de
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app-alpha-backend
+                port:
+                  number: 8080
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# IngressClass objects — provisioned by createController() via Helm values.
+# These are created automatically by the ingress-nginx Helm chart when
+# ingressClassResource.enabled=true. Shown here for documentation clarity.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx-external
+  annotations:
+    # Not the default class — teams must explicitly specify this class.
+    ingressclass.kubernetes.io/is-default-class: "false"
+spec:
+  controller: k8s.io/nginx-external
+
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx-internal
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "false"
+spec:
+  controller: k8s.io/nginx-internal

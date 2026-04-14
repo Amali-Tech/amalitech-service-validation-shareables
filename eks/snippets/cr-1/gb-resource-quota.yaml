@@ -1,0 +1,73 @@
+# =============================================================================
+# Resource Quota + LimitRange — Namespace-level resource governance
+# Prevents individual workloads from causing CPU/memory pressure at node level
+# =============================================================================
+
+---
+# 1. ResourceQuota — Enforces hard limits across all pods in the namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: business-apps-quota
+  namespace: business-apps
+  labels:
+    team: ml-platform
+    environment: production
+spec:
+  hard:
+    # Compute resources
+    requests.cpu: "32"
+    limits.cpu: "64"
+    requests.memory: "64Gi"
+    limits.memory: "128Gi"
+
+    # Object count limits
+    count/pods: "50"
+    count/services: "10"
+    count/configmaps: "20"
+    count/secrets: "20"
+    count/persistentvolumeclaims: "10"
+
+    # Restrict to specific storage class
+    requests.storage: "500Gi"
+
+---
+# 2. LimitRange — Sets per-container defaults and enforces min/max bounds
+# Prevents unbounded resource usage when requests/limits are not explicitly set
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: business-apps-limitrange
+  namespace: business-apps
+  labels:
+    team: ml-platform
+    environment: production
+spec:
+  limits:
+    # Container-level defaults and bounds
+    - type: Container
+      default:
+        cpu: "1"
+        memory: "2Gi"
+      defaultRequest:
+        cpu: "500m"
+        memory: "1Gi"
+      max:
+        cpu: "16"
+        memory: "32Gi"
+      min:
+        cpu: "100m"
+        memory: "128Mi"
+
+    # Pod-level maximum bounds
+    - type: Pod
+      max:
+        cpu: "32"
+        memory: "64Gi"
+
+    # PVC storage bounds
+    - type: PersistentVolumeClaim
+      max:
+        storage: "100Gi"
+      min:
+        storage: "1Gi"

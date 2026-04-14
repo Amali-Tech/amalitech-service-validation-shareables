@@ -1,0 +1,54 @@
+# Karpenter NodePool Manifest with Taint
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: ml-arm-nodes
+spec:
+  template:
+    spec:
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["arm64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["c7g.4xlarge", "c7g.8xlarge"]
+      taints:
+        - key: workload-type
+          value: ml
+          effect: NoSchedule
+  nodeClassRef:
+    name: default
+
+---
+# Deployment Manifest with Node Affinity and Toleration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-training-job
+spec:
+  replicas: 3
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - matchExpressions:
+                - key: karpenter.sh/nodepool
+                  operator: In
+                  values: ["ml-arm-nodes"]
+      tolerations:
+        - key: workload-type
+          operator: Equal
+          value: ml
+          effect: NoSchedule
+      containers:
+        - name: ml-container
+          image: ml-training:latest
+          resources:
+            requests:
+              cpu: "8"
+              memory: "16Gi"

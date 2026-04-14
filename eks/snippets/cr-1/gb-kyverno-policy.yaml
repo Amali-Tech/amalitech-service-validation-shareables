@@ -1,0 +1,147 @@
+# =============================================================================
+# Kyverno ClusterPolicies — Automated detection and prevention controls
+# Enforces soft multi-tenancy best practices at admission time
+# =============================================================================
+
+---
+# 1. Require resource requests and limits on all containers
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-requests-limits
+  annotations:
+    policies.kyverno.io/title: Require Resource Requests and Limits
+    policies.kyverno.io/description: >
+      Ensures every container defines CPU and memory requests and limits
+      to prevent node-level resource pressure.
+spec:
+  validationFailureAction: Enforce # Block non-compliant pods at admission
+  background: true # Also scan existing resources
+  rules:
+    - name: validate-resources
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: "CPU and memory requests and limits are required for all containers."
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  requests:
+                    cpu: "?*"
+                    memory: "?*"
+                  limits:
+                    cpu: "?*"
+                    memory: "?*"
+
+---
+# 2. Require ResourceQuota in every namespace
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-namespace-quota
+  annotations:
+    policies.kyverno.io/title: Require Namespace ResourceQuota
+    policies.kyverno.io/description: >
+      Ensures every namespace has a ResourceQuota defined to prevent
+      individual workloads from consuming excessive cluster resources.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-namespace-quota
+      match:
+        any:
+          - resources:
+              kinds: ["Namespace"]
+      validate:
+        message: "Every namespace must have a ResourceQuota defined."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.name }}"
+                operator: AnyNotIn
+                value: "{{ resourceQuotas.items[].metadata.namespace }}"
+
+---
+# 3. Require images to be pulled from approved ECR registry only
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-ecr-images
+  annotations:
+    policies.kyverno.io/title: Require ECR Image Registry
+    policies.kyverno.io/description: >
+      Ensures all container images are pulled from the approved
+      ECR registry only, preventing use of untrusted public images.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: validate-image-registry
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: "Images must be pulled from the approved ECR registry only."
+        pattern:
+          spec:
+            containers:
+              - image: "<account-id>.dkr.ecr.<region>.amazonaws.com/*"
+
+---
+# 4. Disallow automounting of ServiceAccount tokens unless explicitly required
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-automount-sa-token
+  annotations:
+    policies.kyverno.io/title: Disallow AutoMount ServiceAccount Token
+    policies.kyverno.io/description: >
+      Prevents automatic mounting of ServiceAccount tokens in pods
+      unless explicitly required, reducing the risk of credential exposure.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: validate-automount-token
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: "automountServiceAccountToken must be explicitly set to false unless required."
+        pattern:
+          spec:
+            automountServiceAccountToken: "false"
+
+---
+# 5. Disallow privileged containers
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-containers
+  annotations:
+    policies.kyverno.io/title: Disallow Privileged Containers
+    policies.kyverno.io/description: >
+      Prevents containers from running in privileged mode,
+      reducing the risk of host-level compromise.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: validate-privileged
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: "Privileged containers are not allowed."
+        pattern:
+          spec:
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"

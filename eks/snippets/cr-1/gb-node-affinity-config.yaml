@@ -1,0 +1,145 @@
+# =============================================================================
+# ML Training Workload — All-in-One Configuration
+# Kubernetes API: apps/v1 (Deployment), v1 (Service), autoscaling/v2 (HPA)
+# =============================================================================
+
+---
+# --- 1. Deployment -----------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-training-job
+  labels:
+    app: ml-training-job
+    workload-type: ml
+    arch: arm64
+    environment: production
+spec:
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: ml-training-job
+
+  # [Req 4] Pod replacement strategy: RollingUpdate ensures zero-downtime deploys
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1 # Allow 1 extra pod above desired count during update
+      maxUnavailable: 1 # Allow 1 pod to be unavailable during update
+
+  template:
+    metadata:
+      labels:
+        app: ml-training-job
+        workload-type: ml
+        arch: arm64
+        environment: production
+
+    spec:
+      # [Req 6] Node affinity: schedule only on the ml-arm-nodes Karpenter NodePool
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: karpenter.sh/nodepool
+                    operator: In
+                    values: ["ml-arm-nodes"]
+
+      # [Req 6] Toleration: allows scheduling on nodes tainted with workload-type=ml
+      tolerations:
+        - key: workload-type
+          operator: Equal
+          value: ml
+          effect: NoSchedule
+
+      containers:
+        - name: ml-container
+          image: ml-training:v2.1
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+
+          # Resource requests and limits for HPA and scheduler decisions
+          resources:
+            requests:
+              cpu: "8"
+              memory: "16Gi"
+            limits:
+              cpu: "16"
+              memory: "32Gi"
+
+          # Health probes for reliable pod lifecycle management
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+
+          env:
+            - name: ENV
+              value: "production"
+
+---
+# --- 2. Service --------------------------------------------------------------
+# [Req 7] ClusterIP restricts access to within-cluster only (secure by default)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-training-job-svc
+  labels:
+    app: ml-training-job
+    workload-type: ml
+spec:
+  type: ClusterIP
+  selector:
+    app: ml-training-job # Routes traffic only to pods with this label
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+
+---
+# --- 3. HorizontalPodAutoscaler ----------------------------------------------
+# [Req 4] Pod scaling strategy: HPA scales replicas based on CPU utilization
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ml-training-job-hpa
+  labels:
+    app: ml-training-job
+    workload-type: ml
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ml-training-job
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70 # Scale up when avg CPU exceeds 70%
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75 # Scale up when avg memory exceeds 75%
