@@ -1,0 +1,102 @@
+# =============================================================================
+# RBAC Configuration — Namespace-scoped Role + ClusterRole
+# Implements least-privilege access control per team/workload namespace
+# =============================================================================
+
+---
+# 1. Namespace-scoped Role — Developer access within team namespace only
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: developer
+  namespace: business-apps
+  labels:
+    team: ml-platform
+    environment: production
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"] # Read-only access to secrets
+  - apiGroups: [""]
+    resources: ["pods/log", "pods/exec"]
+    verbs: ["get", "list"] # Allow log access, no exec in prod
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+
+---
+# 2. RoleBinding — Binds developer Role to team OIDC-mapped group
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: developer-binding
+  namespace: business-apps
+  labels:
+    team: ml-platform
+    environment: production
+subjects:
+  - kind: Group
+    name: ml-platform-developers # OIDC group mapped from identity provider
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: developer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# 3. ClusterRole — Read-only cluster-wide visibility for developers
+# Allows developers to view cluster-level resources without modification rights
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-viewer
+  labels:
+    environment: production
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces", "persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+
+---
+# 4. ClusterRoleBinding — Restricted to platform SREs only
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-viewer-binding
+  labels:
+    environment: production
+subjects:
+  - kind: Group
+    name: platform-sre # Only SRE group gets cluster-wide visibility
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: cluster-viewer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# 5. ServiceAccount with IRSA annotation — Scoped AWS access per workload
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ml-training-sa
+  namespace: business-apps
+  labels:
+    app: ml-training-job
+    team: ml-platform
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<account-id>:role/ml-training-role
+    # IAM role grants least-privilege access to specific AWS resources only
+    # e.g. S3 read for training data, ECR pull for container images

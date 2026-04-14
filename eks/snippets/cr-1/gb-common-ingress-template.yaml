@@ -1,0 +1,48 @@
+{{- define "common.ingress" -}}
+{{- if eq .Values.global.istioEnabled false }}
+{{- range $key, $val := .Values.domain }}
+  {{- if eq (tuple $ $val.expose | include "template.toBool") "true" }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $.Values.name }}-{{ $.Chart.Name }}-{{ $key }}
+  labels:
+{{ include "app.labels.static" $ | indent 4 }}
+{{- if $val.labels }}
+{{ toYaml $val.labels | indent 4 }}
+{{- end }}
+    library_chart: "common-{{ $.Values.common_library_version }}"
+  annotations:
+{{- if ($.Values.prometheus | default false) }}
+{{- if not $.Values.prometheus.ServiceMonitor }}
+    prometheus.io/ingress: '{{ $.Values.prometheus.ingress | default "true" }}'
+    prometheus.io/ingress_path: '{{ $.Values.prometheus.ingress_path | default $.Values.health.url }}'
+{{- end }}
+{{- end }}
+{{ toYaml $.Values.route_annotations | indent 4 }}
+spec:
+{{- if ($val.className | default false) }}
+  ingressClassName: {{ $val.className }}
+{{- end }}
+  tls:
+    - hosts:
+        - {{ $.Values.name }}-{{ $.Chart.Name }}{{ include "dns.splitter" $ }}{{ include "env_short_name" $ }}.{{ tpl $val.url $ }}
+      secretName: {{ $.Values.global.ingressSecretName | default (printf "%s-%s-%s" $.Values.name $.Chart.Name $key) }}
+  rules:
+    - host: {{ $.Values.name }}-{{ $.Chart.Name }}{{ include "dns.splitter" $ }}{{ include "env_short_name" $ }}.{{ tpl $val.url $ }}
+      http:
+        paths:
+          - backend:
+              service:
+                name: {{ $.Values.name }}-{{ $.Chart.Name }}
+                port:
+                  name: app
+          {{- if ($val.path | default false) }}
+            path: {{ $val.path }}
+          {{- end }}
+            pathType: {{ $val.pathType }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,50 @@
+variables:
+  PL_PULUMI_CLUSTER_VERSION: &cluster_pipeline_version v1.223
+  PL_PULUMI_FLUX_VERSION: &flux_pipeline_version v1.46
+  PL_PULUMI_INFRA_VERSION: &infra_pipeline_version v1.183
+  PL_PULUMI_ARGOCD_VERSION: &argocd_pipeline_version digihub-310367 #v0.88
+  PL_PULUMI_KYVERNO_VERSION: &kyverno-version v0.2.55
+
+stages:
+  - init
+  - update_cluster
+  - update_flux
+  - update_infra
+  - update_services
+  - destroy_services
+  - destroy_infra
+  - destroy_flux
+  - destroy_cluster
+  - rm
+
+include:
+  - {
+      project: fast/infr/deployment/pipeline-logic/aws-stacks/create-cluster,
+      ref: *cluster_pipeline_version,
+      file: pipeline.yml,
+    }
+  - {
+      project: fast/infr/deployment/pipeline-logic/pulumi-microstacks/flux,
+      ref: *flux_pipeline_version,
+      file: pipeline.yml,
+    }
+  - {
+      project: fast/infr/deployment/pipeline-logic/aws-stacks/infra,
+      ref: *infra_pipeline_version,
+      file: pipeline.yml,
+    }
+  - {
+      project: fast/infr/deployment/pipeline-logic/aws-stacks/argocd,
+      ref: *argocd_pipeline_version,
+      file: pipeline.yml,
+    }
+  - {
+      project: fast/infr/deployment/pipeline-logic/aws-eks-suspension,
+      ref: v0.12,
+      file: pipeline.yml,
+    }
+  - {
+      project: fast/infr/deployment/pipeline-logic/pulumi-microstacks/kyverno,
+      ref: *kyverno-version,
+      file: pipeline.yml,
+    }

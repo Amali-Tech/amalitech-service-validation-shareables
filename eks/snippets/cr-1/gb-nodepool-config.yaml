@@ -1,0 +1,117 @@
+# Karpenter NodePool for ML ARM workloads
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: ml-arm-nodes
+  labels:
+    team: ml-platform
+    environment: production
+spec:
+  # --- Node Template ---
+  template:
+    metadata:
+      labels:
+        workload-type: ml
+        node-arch: arm64
+      annotations:
+        purpose: "ML compute nodes (ARM/Graviton)"
+    spec:
+      requirements:
+        # Architecture: ARM64 (AWS Graviton)
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["arm64"]
+
+        # Capacity type: on-demand only (no spot for ML stability)
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+
+        # Instance types: Graviton3 compute-optimized
+        # c7g.4xlarge  → 16 vCPU / 32 GiB RAM
+        # c7g.8xlarge  → 32 vCPU / 64 GiB RAM
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - "c7g.4xlarge"
+            - "c7g.8xlarge"
+
+        # Restrict to specific availability zones for data locality
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values:
+            - "us-east-1a"
+            - "us-east-1b"
+
+      # Taint to ensure only ML workloads with matching tolerations are scheduled
+      taints:
+        - key: workload-type
+          value: ml
+          effect: NoSchedule
+
+      # Reference to the EC2NodeClass for AWS-specific configuration
+      nodeClassRef:
+        apiVersion: karpenter.k8s.aws/v1beta1
+        kind: EC2NodeClass
+        name: default
+
+  # --- Scaling Limits ---
+  limits:
+    cpu: "256" # Max total CPU across all nodes in this pool
+    memory: "512Gi" # Max total memory across all nodes in this pool
+
+  # --- Disruption / Consolidation Policy ---
+  disruption:
+    consolidationPolicy: WhenUnderutilized # Consolidate idle nodes
+    consolidateAfter: 30s # Wait 30s before consolidating
+    expireAfter: 720h # Recycle nodes after 30 days
+
+  # --- Scheduling Weight (higher = preferred over other NodePools) ---
+  weight: 10
+
+---
+# EC2NodeClass: AWS-specific node configuration
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  # AMI family — AL2 recommended for Graviton ARM workloads
+  amiFamily: AL2
+
+  # IAM role for the node (must have required Karpenter permissions)
+  role: "KarpenterNodeRole-cl03"
+
+  # Subnet selector — nodes will be launched in matching subnets
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "cl03"
+
+  # Security group selector
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "<your-cluster-name>"
+
+  # Block device configuration
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        iops: 3000
+        throughput: 125
+        encrypted: true
+        deleteOnTermination: true
+
+  # User data for node bootstrapping (optional)
+  userData: |
+    #!/bin/bash
+    # Custom bootstrap script for ML nodes
+    echo "vm.max_map_count=262144" >> /etc/sysctl.conf
+    sysctl -p
+  # Instance metadata options
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 2
+    httpTokens: required # Enforce IMDSv2
