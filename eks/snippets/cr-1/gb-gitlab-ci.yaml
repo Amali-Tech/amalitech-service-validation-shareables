@@ -2,7 +2,7 @@ variables:
   PL_PULUMI_CLUSTER_VERSION: &cluster_pipeline_version v1.223
   PL_PULUMI_FLUX_VERSION: &flux_pipeline_version v1.46
   PL_PULUMI_INFRA_VERSION: &infra_pipeline_version v1.183
-  PL_PULUMI_ARGOCD_VERSION: &argocd_pipeline_version digihub-310367 #v0.88
+  PL_PULUMI_ARGOCD_VERSION: &argocd_pipeline_version #v0.88
   PL_PULUMI_KYVERNO_VERSION: &kyverno-version v0.2.55
 
 stages:
